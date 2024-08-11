@@ -288,7 +288,9 @@ class MountEFI:
             if out[2] == 0:
                 print(out[0])
             else:
-                print(out[1])
+                print(out[1] or "Something went wrong")
+                print("")
+                self.u.grab("Press [enter] to return...")
             # Check our settings
             am = self.settings.get("after_mount", None)
             if not am:
