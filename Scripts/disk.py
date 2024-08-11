@@ -247,13 +247,16 @@ class Disk:
     def __init__(self):
         self.r = run.Run()
         self.version_re = re.compile(r"diskdump ([a-zA-z\d]+\.[a-zA-Z\d]+\.[a-zA-Z\d]+)")
+        self.os_build_re = re.compile(r"(?i)(?P<major>\d+)(?P<minor>[a-z]+)(?P<patch>\d+)(?P<suffix>[a-z]*)")
         self.diskdump,self.diskdump_version = self.check_diskdump()
-        self.full_os_version = self.r.run({"args":["sw_vers", "-productVersion"]})[0]
+        self.os_build_number = self.r.run({"args":["sw_vers", "-buildVersion"]})[0].strip()
+        self.full_os_version = self.r.run({"args":["sw_vers", "-productVersion"]})[0].strip()
         if len(self.full_os_version.split(".")) < 3:
             # Ensure the format is XX.YY.ZZ
             self.full_os_version += ".0"
         self.os_version = ".".join(self.full_os_version.split(".")[:2])
         self.sudo_mount_version = "10.13.6"
+        self.use_mount_version = "24A5309e" # Sequoia dev b5 breaks regular mounting
         self.efi_guids = ["C12A7328-F81F-11D2-BA4B-00A0C93EC93B"]
         self.disks = self.get_disks()
 
@@ -486,7 +489,7 @@ class Disk:
         return guid
 
     def get_volume_type(self, disk = None, disk_dict = None):
-        # Returns teh DAVolumeType or DAVolumeKind of the passed disk if any
+        # Returns the DAVolumeType or DAVolumeKind of the passed disk if any
         disk = self.get_disk(disk,disk_dict=disk_dict)
         if not disk: return
         if "DAVolumeType" in disk: return disk["DAVolumeType"]
@@ -667,7 +670,7 @@ class Disk:
         if not mount: return
         return self.r.run({"args":["open", mount]})[2] == 0
 
-    def compare_version(self, v1, v2):
+    def compare_version(self, v1, v2, build_number = False):
         # Splits the version numbers by periods and compare each value
         # Allows 0.0.10 > 0.0.9 where normal string comparison would return false
         # Also strips out any non-numeric values from each segment to avoid conflicts
@@ -676,6 +679,20 @@ class Disk:
         if not all((isinstance(x,str) for x in (v1,v2))):
             # Wrong types
             return False
+        # Check if we're using build numbers - and make sure we have matches
+        if build_number:
+            v1_match = self.os_build_re.match(v1)
+            v2_match = self.os_build_re.match(v2)
+            if not v1_match or not v2_match:
+                # Didn't match the patterns
+                return False
+            # Let's organize them as major.minor.patch.suffix
+            v1 = "{}.{}.{}.{}".format(
+                *[v1_match.group(x) or "0" for x in ("major","minor","patch","suffix")]
+            )
+            v2 = "{}.{}.{}.{}".format(
+                *[v2_match.group(x) or "0" for x in ("major","minor","patch","suffix")]
+            )
         v1_seg = v1.split(".")
         v2_seg = v2.split(".")
         # Pad with 0s to ensure common length
@@ -695,14 +712,94 @@ class Disk:
 
     def needs_sudo(self, disk = None, disk_dict = None):
         # Default to EFI if we didn't pass a disk
-        if not disk: return self.compare_version(self.full_os_version,self.sudo_mount_version) in (True,None)
-        return self.compare_version(self.full_os_version,self.sudo_mount_version) in (True,None) and self.get_content(disk,disk_dict=disk_dict).upper() in self.efi_guids
+        if not disk:
+            return self.compare_version(self.full_os_version,self.sudo_mount_version) in (True,None)
+        # Make sure we have an EFI and a late enough OS version
+        if self.compare_version(self.full_os_version,self.sudo_mount_version) in (True,None):
+            if self.get_content(disk,disk_dict=disk_dict).upper() in self.efi_guids:
+                return True
+        return False
+
+    def needs_mount(self, disk = None, disk_dict = None):
+        # Starting with the Sequoia developer beta 5 (24A5309e), Apple mucked
+        # up mounting FAT32 volumes.  We can bypass this by using
+        # "sudo mount -t msdos /dev/diskXsY /mount/point" instead of
+        # "sudo diskdump mount diskXsY"
+        # Make sure we qualify that it's a FAT32 volume, and create a unique
+        # folder in /Volumes for it to mount.
+        if not disk:
+            return self.compare_version(self.os_build_number,self.use_mount_version,build_number=True) in (True,None)
+        # Make sure it's an EFI partition using FAT32
+        if self.compare_version(self.os_build_number,self.use_mount_version,build_number=True) in (True,None):
+            if self.get_content(disk,disk_dict=disk_dict).upper() in self.efi_guids:
+                if any((x in self.get_volume_type(disk,disk_dict=disk_dict).upper() for x in ("MS-DOS","MSDOS"))):
+                    return True
+        return False
+
+    def get_safe_volume_name(self, disk, disk_dict = None, additional_names = []):
+        # Check if the passed disk's name exists in /Volumes/ - and if so,
+        # increment a numbered suffix until it's unique.  Can also compare to
+        # additional names passed in a list.
+        disk = self.get_identifier(disk,disk_dict=disk_dict)
+        if not disk: return
+        vol_name = self.get_volume_name(disk,disk_dict=disk_dict) or "Untitled"
+        vol_path = os.path.join("/Volumes",vol_name)
+        # Append " #" to our volume name until it doesn't exist in /Volumes/
+        if os.path.exists(vol_path) or vol_name in additional_names:
+            suffix = 1
+            while True:
+                temp_name = "{} {}".format(vol_name,suffix)
+                temp_path = os.path.join("/Volumes",temp_name)
+                if not os.path.exists(temp_path) and not temp_name in additional_names:
+                    # It doesn't exist, use the suffix
+                    vol_name = temp_name
+                    break
+                # Increment the suffix
+                suffix += 1
+        # We should have a unique name now - return it
+        return vol_name
 
     def mount_partition(self, disk, disk_dict = None):
         disk = self.get_identifier(disk,disk_dict=disk_dict)
         if not disk: return
-        sudo = self.needs_sudo(disk,disk_dict=disk_dict)
-        out = self.r.run({"args":[self.diskdump,"mount",disk],"sudo":sudo})
+        # Is it already mounted?  If so - just return a "mounted successfully"
+        # message
+        if self.get_mount_point(disk,disk_dict=disk_dict):
+            vol_name = self.get_volume_name(disk,disk_dict=disk_dict)
+            return (
+                "Volume {} on {} mounted".format(vol_name,disk),
+                "",
+                0
+            )
+        # Check if we're on Sequoia 24A5309e or newer - as we need to
+        # handle mounting differently
+        if self.needs_mount(disk,disk_dict=disk_dict):
+            vol_name = self.get_volume_name(disk,disk_dict=disk_dict)
+            mount_name = self.get_safe_volume_name(disk,disk_dict=disk_dict)
+            mount_path = os.path.join("/Volumes",vol_name)
+            # We should have a usable path now - create it, and mount
+            out = self.r.run({"args":["mkdir",mount_path],"sudo":True})
+            if out[2] != 0:
+                # Something went wrong
+                return out
+            # We should have our dir setup now - let's mount to it
+            out = self.r.run({"args":["mount","-t","msdos","/dev/{}".format(disk),mount_path],"sudo":True})
+            if out[2] != 0:
+                # Something went wrong - check for the target folder
+                if os.path.isdir(mount_path):
+                    # Attempt to remove the directory
+                    self.r.run({"args":["rm","-f",mount_path],"sudo":True})
+            elif not out[0]:
+                # The mount completed and we got no output
+                # let's give similar diskutil/diskdump output
+                out = (
+                    "Volume {} on {} mounted".format(vol_name,disk),
+                    out[1],
+                    out[2]
+                )
+        else:
+            sudo = self.needs_sudo(disk,disk_dict=disk_dict)
+            out = self.r.run({"args":[self.diskdump,"mount",disk],"sudo":sudo})
         self.update()
         return out
 
@@ -742,16 +839,47 @@ if __name__ == '__main__':
             errors.append("'{}' does not exist.".format(x))
             continue
         args.append(x)
-    mount_list = []
-    needs_sudo = d.needs_sudo()
+    mount_list  = []
+    needs_sudo  = d.needs_sudo()
+    needs_mount = d.needs_mount()
+    diskdump    = "" if needs_mount else d.diskdump.replace('"','\\\\\\"') # Escape double quotes in names
+    used_names  = [] # Placeholder array if we're "sudo mount"ing
     for x in args:
         name = d.get_volume_name(x)
         if not name: name = "Untitled"
         name = name.replace('"','\\"') # Escape double quotes in names
-        diskdump = d.diskdump.replace('"','\\\\\\"') # Escape double quotes in names
         efi = d.get_efi(x)
-        if efi: mount_list.append((efi,name,d.is_mounted(efi),"\\\"{}\\\" mount {}".format(diskdump,efi)))
-        else: errors.append("'{}' has no ESP.".format(name))
+        if efi:
+            is_mounted = d.is_mounted(efi)
+            if needs_mount:
+                # We need to use "sudo mount", let's set up an unused mount point
+                vol_name = d.get_safe_volume_name(efi,additional_names=used_names)
+                vol_path = os.path.join("/Volumes",vol_name)
+                # Retain the name so we don't try using it again
+                used_names.append(vol_name)
+                # Set up our command
+                mount_list.append((
+                    efi,
+                    name,
+                    is_mounted,
+                    "mkdir \\\"{0}\\\"; mount -t msdos /dev/{1} \\\"{0}\\\"".format(
+                        vol_path,
+                        efi
+                    )
+                ))
+            else:
+                # Just using regular "diskdump mount"
+                mount_list.append((
+                    efi,
+                    name,
+                    d.is_mounted(efi),
+                    "\\\"{}\\\" mount {}".format(
+                        diskdump,
+                        efi
+                    )
+                ))
+        else:
+            errors.append("'{}' has no ESP.".format(name))
     if mount_list:
         # We have something to mount
         efis =  [x[-1] for x in mount_list if not x[2]] # Only mount those that aren't mounted
@@ -763,14 +891,17 @@ if __name__ == '__main__':
                 ", ".join(names),
                 " with administrator privileges" if needs_sudo else "")
             o,e,r = d.r.run({"args":["osascript","-e",command]})
-            if r > 0 and len(e.strip()) and e.strip().lower().endswith("(-128)"): exit() # User canceled, bail
+            if r > 0 and len(e.strip()) and e.strip().lower().endswith("(-128)"):
+                exit() # User canceled, bail
             # Update the disks
             d.update()
         # Walk the mounts and find out which aren't mounted
         for efi,name,mounted,comm in mount_list:
             mounted_at = d.get_mount_point(efi)
-            if mounted_at: d.open_mount_point(mounted_at)
-            else: errors.append("ESP for '{}' failed to mount.".format(name))
+            if mounted_at:
+                d.open_mount_point(mounted_at)
+            else:
+                errors.append("ESP for '{}' failed to mount.".format(name))
     else:
         errors.append("No disks with ESPs selected.")
     if errors:
