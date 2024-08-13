@@ -264,7 +264,7 @@ class MountEFI:
                 self.u.grab("Returning in 5 seconds...", timeout=5)
                 continue
             # Valid disk!
-            efi = self.d.get_efi(iden)
+            efi = self.d.get_efis(iden)
             if not efi:
                 self.u.head("No EFI Partition")
                 print("")
@@ -282,13 +282,18 @@ class MountEFI:
                 continue
             # Resize and then mount the EFI partition
             if self.settings.get("resize_window",True): self.u.resize(80, 24)
-            self.u.head("Mounting {}".format(efi))
+            self.u.head("Mounting EFI Partition{}".format("" if len(efi) == 1 else "s"))
             print(" ")
-            out = self.d.mount_partition(efi)
-            if out[2] == 0:
-                print(out[0])
-            else:
-                print(out[1] or "Something went wrong")
+            failed = False
+            for e in efi:
+                print("Mounting {}...".format(e))
+                out = self.d.mount_partition(e)
+                if out[2] == 0:
+                    print(out[0].strip())
+                else:
+                    print(out[1].strip() or "Something went wrong")
+                    failed = True
+            if failed:
                 print("")
                 self.u.grab("Press [enter] to return...")
             # Check our settings

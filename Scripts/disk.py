@@ -745,22 +745,29 @@ if __name__ == '__main__':
     mount_list = []
     needs_sudo = d.needs_sudo()
     for x in args:
-        name = d.get_volume_name(x)
-        if not name: name = "Untitled"
+        name = d.get_volume_name(x) or "Untitled"
         name = name.replace('"','\\"') # Escape double quotes in names
         diskdump = d.diskdump.replace('"','\\\\\\"') # Escape double quotes in names
-        efi = d.get_efi(x)
-        if efi: mount_list.append((efi,name,d.is_mounted(efi),"\\\"{}\\\" mount {}".format(diskdump,efi)))
-        else: errors.append("'{}' has no ESP.".format(name))
+        efi = d.get_efis(x)
+        if efi: 
+            for i,e in enumerate(efi):
+                mount_list.append((
+                    e,
+                    name if i == 0 else "", # Omit the name after the first ESP
+                    d.is_mounted(e),
+                    "\\\"{}\\\" mount {}".format(diskdump,e)
+                ))
+        else:
+            errors.append("'{}' has no ESP.".format(name))
     if mount_list:
         # We have something to mount
         efis =  [x[-1] for x in mount_list if not x[2]] # Only mount those that aren't mounted
-        names = [x[1]  for x in mount_list if not x[2]]
+        names = [x[1]  for x in mount_list if x[1] and not x[2]]
         if efis: # We have something to mount here
             command = "do shell script \"{}\" with prompt \"MountEFI would like to mount the ESP{} on {}\"{}".format(
                 "; ".join(efis),
-                "s" if len(names) > 1 else "",
-                ", ".join(names),
+                "s" if len(efis) > 1 else "",
+                names[0] if len(names) == 1 else " and ".join([", ".join(names[:-1]),names[-1]]),
                 " with administrator privileges" if needs_sudo else "")
             o,e,r = d.r.run({"args":["osascript","-e",command]})
             if r > 0 and len(e.strip()) and e.strip().lower().endswith("(-128)"): exit() # User canceled, bail
